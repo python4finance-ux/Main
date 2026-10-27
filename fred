@@ -1,0 +1,80 @@
+import fred
+import pandas as pd
+import sqlite3
+from getpass import getpass
+
+fred.key(getpass("FRED API key: "))
+
+series_ids = [
+    "INDPRO", "PCEC96",
+    "PAYEMS", "UNRATE", "ICSA",
+    "CPIAUCSL", "PCEPILFE",
+    "DFF", "DGS2", "DGS10", "VIXCLS",
+]
+
+
+def download_vintages(series_id):
+    records = []
+    offset = 0
+
+    while True:
+        response = fred.observations(
+            series_id,
+            observation_start="1990-01-01",
+            realtime_start="1776-07-04",
+            realtime_end="9999-12-31",
+            output_type=1,
+            limit=100000,
+            offset=offset,
+        )
+
+        # Support the package's nested dictionary response,
+        # as well as FRED's JSON-style response.
+        root = response["observations"]
+        rows = root["observation"] if isinstance(root, dict) else root
+        if isinstance(rows, dict):
+            rows = [rows]
+
+        count_source = root if isinstance(root, dict) else response
+        count = int(count_source.get("count", count_source.get("@count")))
+
+        if not rows and offset < count:
+            raise RuntimeError(f"Incomplete response for {series_id}")
+
+        records.extend(rows)
+        offset += len(rows)
+
+        if offset >= count:
+            break
+
+    data = pd.DataFrame(records).rename(columns={
+        "date": "observation_date",
+        "realtime_start": "vintage_date",
+        "realtime_end": "valid_until",
+    })
+
+    data["series_id"] = series_id
+    data["value"] = pd.to_numeric(
+        data["value"].replace(".", None), errors="raise"
+    )
+
+    return data[
+        ["series_id", "observation_date",
+         "vintage_date", "valid_until", "value"]
+    ]
+
+
+tables = []
+
+for series_id in series_ids:
+    print(f"Downloading {series_id}")
+    tables.append(download_vintages(series_id))
+
+observations = pd.concat(tables, ignore_index=True)
+
+with sqlite3.connect("research.sqlite") as db:
+    observations.to_sql(
+        "observations", db, if_exists="replace", index=False
+    )
+
+print(f"Saved {len(observations):,} version records.")

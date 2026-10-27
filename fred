@@ -1,53 +1,83 @@
-import fred
-import pandas as pd
-import sqlite3
-from getpass import getpass
-
-fred.key(getpass("FRED API key: "))
-
-series_ids = [
-    "INDPRO", "PCEC96",
-    "PAYEMS", "UNRATE", "ICSA",
-    "CPIAUCSL", "PCEPILFE",
-    "DFF", "DGS2", "DGS10", "VIXCLS",
-]
+from datetime import date
+import time
 
 
 def download_vintages(series_id):
     records = []
-    offset = 0
+    today = date.today()
 
-    while True:
-        response = fred.observations(
-            series_id,
-            observation_start="1990-01-01",
-            realtime_start="1776-07-04",
-            realtime_end="9999-12-31",
-            output_type=1,
-            limit=100000,
-            offset=offset,
-        )
+    for year in range(1990, today.year + 1):
+        start = f"{year}-01-01"
+        end = min(f"{year}-12-31", today.isoformat())
+        offset = 0
 
-        # Support the package's nested dictionary response,
-        # as well as FRED's JSON-style response.
-        root = response["observations"]
-        rows = root["observation"] if isinstance(root, dict) else root
-        if isinstance(rows, dict):
-            rows = [rows]
+        while True:
+            response = fred.observations(
+                series_id,
+                observation_start="1990-01-01",
+                realtime_start=start,
+                realtime_end=end,
+                output_type=1,
+                limit=100000,
+                offset=offset,
+            )
 
-        count_source = root if isinstance(root, dict) else response
-        count = int(count_source.get("count", count_source.get("@count")))
+            root = response["observations"]
 
-        if not rows and offset < count:
-            raise RuntimeError(f"Incomplete response for {series_id}")
+            if isinstance(root, dict):
+                rows = root.get("observation", [])
+                count = int(root.get("count", root.get("@count")))
+            else:
+                rows = root
+                count = int(response["count"])
 
-        records.extend(rows)
-        offset += len(rows)
+            if isinstance(rows, dict):
+                rows = [rows]
 
-        if offset >= count:
-            break
+            if not rows and offset < count:
+                raise RuntimeError(f"Incomplete response: {series_id}")
 
-    data = pd.DataFrame(records).rename(columns={
+            records.extend(rows)
+            offset += len(rows)
+            time.sleep(0.6)
+
+            if offset >= count:
+                break
+
+    # A value may remain unchanged across several requested years.
+    # Join those adjacent intervals to remove artificial year boundaries.
+    records.sort(key=lambda r: (r["date"], r["realtime_start"]))
+    merged = []
+
+    for row in records:
+        row = row.copy()
+
+        if merged:
+            previous = merged[-1]
+            adjacent = (
+                date.fromisoformat(row["realtime_start"]).toordinal()
+                <= date.fromisoformat(
+                    previous["realtime_end"]
+                ).toordinal() + 1
+            )
+
+            if (
+                row["date"] == previous["date"]
+                and row["value"] == previous["value"]
+                and adjacent
+            ):
+                previous["realtime_end"] = max(
+                    previous["realtime_end"],
+                    row["realtime_end"],
+                )
+                continue
+
+        merged.append(row)
+
+    data = pd.DataFrame(
+        merged,
+        columns=["date", "realtime_start", "realtime_end", "value"],
+    ).rename(columns={
         "date": "observation_date",
         "realtime_start": "vintage_date",
         "realtime_end": "valid_until",
@@ -62,19 +92,3 @@ def download_vintages(series_id):
         ["series_id", "observation_date",
          "vintage_date", "valid_until", "value"]
     ]
-
-
-tables = []
-
-for series_id in series_ids:
-    print(f"Downloading {series_id}")
-    tables.append(download_vintages(series_id))
-
-observations = pd.concat(tables, ignore_index=True)
-
-with sqlite3.connect("research.sqlite") as db:
-    observations.to_sql(
-        "observations", db, if_exists="replace", index=False
-    )
-
-print(f"Saved {len(observations):,} version records.")
